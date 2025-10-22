@@ -1,22 +1,45 @@
-"""Historical data extraction to Parquet files."""
+"""Etherscan API client implementation."""
 
-import logging
-import json
-import os
+import os, json, csv, logging
 
-from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Literal, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Literal, Tuple
+from dataclasses import dataclass
 
 import polars as pl
-import pandas as pd
 import dlt
 from dlt.sources.rest_api import rest_api_source
 from dlt.sources.helpers.rest_client import paginators
 
-from .exceptions import APIError
 from .base import BaseAPIClient, BaseSource, APIConfig
-from ..config import APIUrls, APIs
+from .base import APIError
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class APIs:
+    """API-specific settings."""
+
+    etherscan_api_key: Optional[str] = None
+    coingecko_api_key: Optional[str] = None
+
+    # Rate limits (requests per second)
+    etherscan_rate_limit: float = 5.0
+    coingecko_rate_limit: float = 5.0
+    defillama_rate_limit: float = 10.0
+
+    def __post_init__(self):
+        # Load from environment if not provided
+        if self.etherscan_api_key is None:
+            self.etherscan_api_key = os.getenv("ETHERSCAN_API_KEY")
+
+
+class APIUrls:
+    """API endpoint URLs."""
+
+    ETHERSCAN = "https://api.etherscan.io/v2/api"
 
 
 class EtherscanClient(BaseAPIClient):
@@ -26,7 +49,8 @@ class EtherscanClient(BaseAPIClient):
     def _load_chainid_mapping(cls) -> Dict[str, int]:
         """Load chain name to chainid mapping from resource file."""
         # Get the path to the chainid.json file relative to this module
-        chainid_path = Path(__file__).parent.parent / "config/chainid.json"
+        current_file = Path(__file__)
+        chainid_path = current_file.parent.parent / "config" / "chainid.json"
 
         try:
             with chainid_path.open("r") as f:
@@ -122,7 +146,7 @@ class EtherscanClient(BaseAPIClient):
         try:
             contract_metadata = self.get_contract_metadata(address)
         except Exception as e:
-            self.logger.warning(f"Could not get metadata for {address}: {e}")
+            logger.warning(f"Could not get metadata for {address}: {e}")
             contract_metadata = {}
 
         # Fetch main contract ABI
@@ -150,7 +174,7 @@ class EtherscanClient(BaseAPIClient):
                     impl_result = self.make_request("", impl_params)
                     implementation_abi = json.loads(impl_result)
                 except Exception as e:
-                    self.logger.warning(
+                    logger.warning(
                         f"Could not fetch implementation ABI for {implementation_address}: {e}"
                     )
 
@@ -246,26 +270,25 @@ class EtherscanClient(BaseAPIClient):
         csv_path = os.path.join(save_dir, "implementation.csv")
 
         # Check if file exists to determine whether to write headers
-        if not os.path.exists(csv_path):
+        if not csv_path.exists():
             # Create new file with headers
-            with open(csv_path, "w") as f:
+            with csv_path.open("w") as f:
                 f.write("address,implementation_address\n")
 
-        with open(csv_path, "a") as f:
+        with csv_path.open("a") as f:
             f.write(f"{address},{implementation_address}\n")
-        df = pd.read_csv(csv_path)
-        df = df.drop_duplicates()
-        df.to_csv(csv_path, index=False)
+        df = pl.read_csv(csv_path).unique()
+        df.write_csv(csv_path, separator=",", has_header=True)
 
         # Save main ABI
-        main_path = os.path.join(save_dir, f"{address}.json")
+        main_path = Path(save_dir) / f"{address}.json"
         with open(main_path, "w") as f:
             json.dump(abi, f, indent=2)
         pass  # ABI saved
 
         # Save implementation ABI if available
         if implementation_abi:
-            impl_path = os.path.join(save_dir, f"{implementation_address}.json")
+            impl_path = Path(save_dir) / f"{implementation_address}.json"
             with open(impl_path, "w") as f:
                 json.dump(implementation_abi, f, indent=2)
             pass  # Implementation ABI saved
@@ -274,10 +297,20 @@ class EtherscanClient(BaseAPIClient):
         """Save transaction receipt to file."""
         os.makedirs(save_dir, exist_ok=True)
 
-        receipt_path = os.path.join(save_dir, f"{txhash}.json")
+        receipt_path = Path(save_dir) / f"{txhash}.json"
         with open(receipt_path, "w") as f:
             json.dump(receipt, f, indent=2)
         pass  # Receipt saved
+
+    def get_block_number_by_timestamp(self, timestamp: int) -> int:
+        """Get block number by timestamp."""
+        params = {
+            "module": "block",
+            "action": "getblocknobytime",
+            "timestamp": timestamp,
+            "closest": "before",
+        }
+        return int(self.make_request("", params))
 
 
 class EtherscanSource(BaseSource):
@@ -335,10 +368,8 @@ class EtherscanSource(BaseSource):
             pass  # Fetching logs for address
 
             source = self.create_dlt_source(**params)
-            # Extract the resource from the source
-            resource = list(source.resources.values())[0]
-            for item in resource:
-                item["chainid"] = self.client.chainid
+            for item in source:
+                item["chain"] = self.client.chain
                 yield item
 
         return dlt.resource(
@@ -380,10 +411,8 @@ class EtherscanSource(BaseSource):
             pass  # Fetching transactions for address
 
             source = self.create_dlt_source(**params)
-            # Extract the resource from the source
-            resource = list(source.resources.values())[0]
-            for item in resource:
-                item["chainid"] = self.client.chainid
+            for item in source:
+                item["chain"] = self.client.chain
                 yield item
 
         return dlt.resource(
@@ -399,38 +428,31 @@ class EtherscanExtractor:
 
     Example:
         extractor = EtherscanExtractor(etherscan_client)
-
-        # Extract logs for single address
-        path = extractor.to_parquet("0x123...", "ethereum", "logs")
-
     """
 
     def __init__(
         self,
         client: EtherscanClient,
-        save_dir: str = os.getenv("PARQUET_DATA_DIR"),
     ):
         self.client = client
-        self.save_dir = save_dir
-        self.logger = logging.getLogger(self.__class__.__name__)
 
     def to_parquet(
         self,
         address: str,
-        chain: str = "ethereum",
-        table: Literal["logs", "transactions"] = "logs",
-        from_block: int = 0,
-        to_block: str = "latest",
+        from_block: int,
+        to_block: str,
+        chain: str,
+        table: str,
+        output_path: Path,
         offset: int = 1000,
-        output_path: Optional[str] = None,
-    ) -> Optional[str]:
+    ):
         """
         Core building block function to extract blockchain data to Parquet files.
 
         Args:
             address: Contract address to extract data for
             chain: Blockchain network (default: "ethereum")
-            table: Type of data to extract ("logs" or "transactions")
+            table: logs, transactions
             from_block: Starting block number
             to_block: Ending block number or "latest"
             offset: Number of records per API call
@@ -438,10 +460,6 @@ class EtherscanExtractor:
         Returns:
             Path to the created Parquet file, or None if no data extracted
         """
-        self.logger.debug(
-            f"Extracting {table} for address {address} on {chain} from block {from_block} to {to_block}"
-        )
-
         source = EtherscanSource(self.client)
         data = []
 
@@ -455,10 +473,7 @@ class EtherscanExtractor:
                 )
 
                 for record in resource:
-                    # Convert hex strings to integers for numeric fields
                     record = self._process_hex_fields(record)
-                    record["contract_address"] = address
-                    record["chain"] = chain
                     data.append(record)
 
             elif table == "transactions":
@@ -470,22 +485,51 @@ class EtherscanExtractor:
                 )
 
                 for record in resource:
-                    # Convert hex strings to integers for numeric fields
                     record = self._process_hex_fields(record)
-                    record["address"] = address
-                    record["chain"] = chain
                     data.append(record)
 
             if len(data) == 0:
-                self.logger.debug(f"No {table} extracted for address {address}")
-            return self._save_to_parquet(address, chain, table, data, output_path)
+                logger.info(
+                    f"{chain} - {address} - {table} - {from_block}-{to_block}, ✅ no data extracted"
+                )
+            elif len(data) >= 10_000:
+                """
+                when >10000 records, potential missing data due to too many records, so no saving to parquet but
+                log to logging/extract_error and will retry with smaller chunk size
+                """
+                logger.warning(
+                    f"{chain} - {address} - {table} - {from_block}-{to_block}, ⚠️ {len(data)} records"
+                )
 
-        except APIError as e:
-            self.logger.error(f"Failed to fetch {table} for {address}: {e}")
-            return None
-        except Exception as e:
-            self.logger.error(f"Unexpected error fetching {table} for {address}: {e}")
-            return None
+                _log_error_to_csv(
+                    address=address,
+                    chain=chain,
+                    table=table,
+                    from_block=from_block,
+                    to_block=to_block,
+                    block_chunk_size=to_block - from_block,
+                )
+            else:
+                self._save_to_parquet(
+                    chain, address, table, from_block, to_block, data, output_path
+                )
+        except:
+            """
+            this is unlikely to happen, but if it does, treat it as a potential missing data and
+            log to logging/extract_error and will retry with smaller chunk size
+            """
+            logger.error(
+                f"{chain} - {address} - {table} - {from_block}-{to_block}, 🚨 unexpected error"
+            )
+
+            _log_error_to_csv(
+                address=address,
+                chain=chain,
+                table=table,
+                from_block=from_block,
+                to_block=to_block,
+                block_chunk_size=to_block - from_block,
+            )
 
     def _process_hex_fields(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Convert numeric string fields to integers (handles both hex and decimal formats)."""
@@ -516,7 +560,7 @@ class EtherscanExtractor:
                             # Decimal format (transactions API)
                             record[field] = int(str_value, 10)
                     except ValueError:
-                        self.logger.warning(
+                        logger.warning(
                             f"Could not convert {field} value '{str_value}' to int"
                         )
                         record[field] = None
@@ -527,64 +571,156 @@ class EtherscanExtractor:
 
     def _save_to_parquet(
         self,
-        address: str,
         chain: str,
+        address: str,
         table: str,
+        from_block: int,
+        to_block: int,
         data: List[Dict[str, Any]],
-        output_path: Optional[str] = None,
+        output_path: Path,
     ) -> str:
-        """Save data to Parquet file organized by chain/table/address."""
-        # Create output directory structure: chain=ethereum/table=logs/address=0x123...
-        if output_path is None:
-            output_dir = Path(self.save_dir) / f"{chain}_{address}"
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            output_path = output_dir / f"{table}.parquet"
-        else:
-            # Ensure output_path is a Path object
-            output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if len(data) == 0:
-            self.logger.debug(f"No {table} data to save for address {address}")
-            return str(output_path)
-
+        """Save data to Parquet file organized by chain_address_table_from_block_to_block."""
         try:
             # Create Polars DataFrame
-            new_lazy = pl.LazyFrame(data)
+            new_lf = pl.LazyFrame(data)
 
             # Save to Parquet (append if file exists)
             if output_path.exists():
                 # Use scan_parquet for memory efficiency, then concatenate and collect
-                existing_lazy = pl.scan_parquet(output_path)
+                existing_lf = pl.scan_parquet(output_path)
 
                 # Ensure column order matches between existing and new data
-                existing_columns = existing_lazy.collect_schema().names()
-                new_lazy = new_lazy.select(existing_columns)
+                existing_columns = existing_lf.collect_schema().names()
+                new_lf = new_lf.select(existing_columns)
 
-                combined_lazy = pl.concat([existing_lazy, new_lazy]).unique()
-                # only keep unique records, sometime dup happens especially running retry_failed_blocks
+                combined_lf = pl.concat([existing_lf, new_lf]).unique()
+                combined_lf.collect().write_parquet(output_path)
 
-                # Get count
-                existing_count = existing_lazy.select(pl.len()).collect().item()
-                combined_count = combined_lazy.select(pl.len()).collect().item()
-
-                if existing_count != combined_count:
-                    # Materialize and write the combined data
-                    combined_lazy.collect().write_parquet(output_path)
-                    self.logger.debug(
-                        f"{output_path}: Existing count: {existing_count}, added: {combined_count - existing_count}"
-                    )
-                else:
-                    self.logger.debug(f"{output_path}: No new records to append")
+                logger.info(
+                    f"{chain} - {address} - {table} - {from_block}-{to_block}: {len(data)} saved"
+                )
 
             else:
                 # Write new file
-                new_lazy.collect().write_parquet(output_path)
-                self.logger.debug(f"{output_path}: Created new file")
+                new_lf.collect().write_parquet(output_path)
+                logger.info(
+                    f"{chain} - {address} - {table} - {from_block}-{to_block}: {len(data)} saved"
+                )
 
-            return str(output_path)
+            return output_path
 
         except Exception as e:
-            self.logger.error(f"Failed to save {table} data for address {address}: {e}")
+            logger.error(f"Failed to save data: {e}")
             raise
+
+
+def etherscan_to_parquet(
+    address: str,
+    etherscan_client: EtherscanClient,
+    from_block: int,
+    to_block: int,
+    output_path: Path,
+    table,
+    block_chunk_size: int = 10_000,
+) -> Path:
+    """Backfill blockchain data from Etherscan to protocol-grouped Parquet files in chunks.
+
+    This function efficiently extracts historical data and saves to Parquet files:
+    - logs of a specific contract address
+    - transactions to a specific contract address (optional)
+
+    Args:
+        address: Ethereum address to fetch data for (case-insensitive)
+        etherscan_client: Configured Etherscan API client for data retrieval
+        from_block: Starting block number (uses contract creation block if None)
+        to_block: Ending block number (uses latest block if None)
+        block_chunk_size: Number of blocks to process per chunk (default: 50,000)
+        data_dir: Path for parquet file output
+        table: logs, transactions
+    Returns:
+        Path to the parquet file
+    """
+
+    extractor = EtherscanExtractor(etherscan_client)
+    address = address.lower()
+    chain = etherscan_client.chain
+
+    end_block = to_block
+
+    assert from_block < to_block, "from_block must be less than to_block"
+    assert (
+        block_chunk_size < to_block - from_block
+    ), "block_chunk_size must be less than to_block - from_block"
+
+    for chunk_start in range(
+        from_block, end_block - block_chunk_size + 1, block_chunk_size
+    ):
+        chunk_end = min(chunk_start + block_chunk_size, end_block)
+
+        extractor.to_parquet(
+            address=address,
+            chain=chain,
+            table=table,
+            from_block=chunk_start,
+            to_block=chunk_end,
+            offset=1000,
+            output_path=output_path,
+        )
+    if chunk_end < end_block:
+        extractor.to_parquet(
+            address=address,
+            chain=chain,
+            table=table,
+            from_block=chunk_end,
+            to_block=end_block,
+            offset=1000,
+            output_path=output_path,
+        )
+    return output_path
+
+
+def _log_error_to_csv(
+    address: str,
+    chain: str,
+    table: str,
+    from_block: int,
+    to_block: int,
+    block_chunk_size: int,
+):
+    """Log an error to CSV file."""
+    error_file = Path(f"logging/extract_error/{chain}_{address}_{table}.csv")
+    error_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # CSV headers
+    csv_headers = [
+        "timestamp",
+        "address",
+        "chain",
+        "from_block",
+        "to_block",
+        "block_chunk_size",
+    ]
+
+    # Check if file exists to determine if we need to write headers
+    file_exists = error_file.exists()
+
+    # Append error to CSV file immediately
+    with error_file.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+
+        # Write headers if this is a new file
+        if not file_exists:
+            writer.writerow(csv_headers)
+
+        timestamp = datetime.now().isoformat()
+
+        writer.writerow(
+            [
+                timestamp,
+                address,
+                chain,
+                from_block,
+                to_block,
+                block_chunk_size,
+            ]
+        )
