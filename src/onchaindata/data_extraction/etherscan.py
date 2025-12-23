@@ -14,6 +14,7 @@ from dlt.sources.helpers.rest_client import paginators
 
 from .base import BaseAPIClient, BaseSource, APIConfig
 from .base import APIError
+from ..utils.chain import chainid_data
 
 logger = logging.getLogger(__name__)
 
@@ -47,20 +48,8 @@ class EtherscanClient(BaseAPIClient):
 
     @classmethod
     def _load_chainid_mapping(cls) -> Dict[str, int]:
-        """Load chain name to chainid mapping from resource file."""
-        # Get the path to the chainid.json file relative to this module
-        current_file = Path(__file__)
-        chainid_path = current_file.parent.parent / "config" / "chainid.json"
-
-        try:
-            with chainid_path.open("r") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"Chain ID mapping file not found at {chainid_path}"
-            )
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in chain ID mapping file: {e}")
+        """Load chain name to chainid mapping from utils.chain."""
+        return chainid_data
 
     def __init__(
         self,
