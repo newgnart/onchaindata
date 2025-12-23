@@ -1,26 +1,15 @@
 [project]
 name = "onchaindata"
-version = "0.0.1"
-description = "Toolkit for extracting, loading onchain data"
+version = "0.0.2"
+description = "Toolkit for getting onchain data"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "dbt-core>=1.10.6",
-    "dbt-postgres>=1.9.0",
     "dlt[duckdb]>=1.14.1",
-    "duckdb>=1.1.0",
     "eth-hash[pycryptodome]>=0.7.1",
-    "jupyter>=1.1.1",
-    "pandas>=2.3.1",
-    "plotly>=6.3.0",
-    "polars>=1.33.1",
-    "psycopg2>=2.9.10",
-    "pyarrow>=21.0.0",
     "pytest>=8.4.1",
     "python-dotenv>=1.1.1",
     "requests>=2.32.4",
-    "sqlalchemy>=2.0.41",
-    "web3>=7.13.0",
 ]
 
 [tool.uv.sources]
