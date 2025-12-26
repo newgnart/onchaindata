@@ -256,7 +256,7 @@ class EtherscanClient(BaseAPIClient):
         """Save ABI(s) to file."""
         os.makedirs(save_dir, exist_ok=True)
         # create a csv file with the following columns: address, implementation_address
-        csv_path = os.path.join(save_dir, "implementation.csv")
+        csv_path = Path(save_dir) / "implementation.csv"
 
         # Check if file exists to determine whether to write headers
         if not csv_path.exists():
@@ -267,7 +267,7 @@ class EtherscanClient(BaseAPIClient):
         with csv_path.open("a") as f:
             f.write(f"{address},{implementation_address}\n")
         df = pl.read_csv(csv_path).unique()
-        df.write_csv(csv_path, separator=",", has_header=True)
+        df.write_csv(csv_path, separator=",", include_header=True)
 
         # Save main ABI
         main_path = Path(save_dir) / f"{address}.json"
